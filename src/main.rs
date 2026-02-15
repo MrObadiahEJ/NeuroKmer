@@ -1,11 +1,6 @@
-// src/main.rs
-// Clean, compiling version for the current pooled neuron design
-// No associative memory integration yet (to avoid errors – add later)
-// Uses fixed pool_size for constant memory
-
 use clap::Parser;
 use log::info;
-use neurokmer::{NeuroResult, SpikingKmerCounter, init_logging, stream_sequences};
+use neurokmer::{init_logging, stream_sequences, SpikingKmerCounter, NeuroResult};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -19,17 +14,8 @@ struct Cli {
     #[arg(short, long, default_value_t = 31)]
     k: usize,
 
-    #[arg(long, default_value_t = 1.0)]
-    threshold: f64,
-
-    #[arg(long, default_value_t = 0.95)]
-    leak: f64,
-
-    #[arg(long, default_value_t = 2)]
-    refractory: u32,
-
     #[arg(long, default_value_t = 1_000_000)]
-    pool_size: usize, // Fixed neuron pool – controls memory/accuracy trade-off
+    pool_size: usize,  // Fixed neuron pool – controls memory/accuracy trade-off
 }
 
 fn main() -> NeuroResult<()> {
@@ -43,32 +29,43 @@ fn main() -> NeuroResult<()> {
 
     let mut counter = SpikingKmerCounter::new(
         args.k,
-        args.threshold,
-        args.leak,
-        args.refractory,
-        1.0,            // spike_cost
-        args.pool_size, // Fixed pool size
+        1.0,     // threshold (fixed – tunable later)
+        0.95,    // leak
+        2,       // refractory
+        1.0,     // spike_cost
+        args.pool_size,
     );
 
-    for seq in stream_sequences(&args.input)? {
-        counter.process_sequence(&seq);
-    }
-    println!("\n=== K-mer Counts (first 20) ===");
-    let mut counts: Vec<_> = counter.counts.iter().map(|ref_multi| (*ref_multi.key(), *ref_multi.value())).collect();
-    counts.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by count descending
+    // Collect all sequences once (streaming but in-memory for parallel)
+    let seqs: Vec<Vec<u8>> = stream_sequences(&args.input)?.collect();
 
-    for (i, (kmer, count)) in counts.iter().take(20).enumerate() {
-        println!("{:3}: k-mer {:016x} → {} counts", i + 1, kmer, count);
+    // Always use parallel version – fast & safe with atomics
+    counter.process_parallel(&seqs);
+
+    // Output top abundant neuron groups
+    println!("\n=== Top 20 Abundant Neuron Groups (Highest Spike Rates) ===");
+    let top = counter.top_abundant_neurons(20);
+    if top.is_empty() {
+        println!("No spikes fired (empty file or too small k)");
+    } else {
+        for (rank, (idx, spikes, uniques)) in top.iter().enumerate() {
+            println!(
+                "{:3}: Neuron {:6} → {:8} spikes ({} unique k-mers colliding)",
+                rank + 1,
+                idx,
+                spikes,
+                uniques
+            );
+        }
     }
 
-    println!("\nTotal distinct k-mers: {}", counts.len());
     info!(
         "Processing complete – total spikes: {}, energy: {}",
         counter.energy.total_spikes,
         counter.energy_used()
     );
 
-    println!("Total spikes fired: {}", counter.energy.total_spikes);
+    println!("\nTotal spikes fired: {}", counter.energy.total_spikes);
     println!("Simulated energy used: {}", counter.energy_used());
     println!("Neuron pool size used: {}", args.pool_size);
 
