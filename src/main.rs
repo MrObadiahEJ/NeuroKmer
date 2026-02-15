@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use log::info;
-use neurokmer::{init_logging, stream_sequences, SpikingKmerCounter, NeuroResult};
+use neurokmer::{NeuroResult, SpikingKmerCounter, init_logging, stream_sequences};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -29,7 +29,7 @@ struct Cli {
     refractory: u32,
 
     #[arg(long, default_value_t = 1_000_000)]
-    pool_size: usize,  // Fixed neuron pool – controls memory/accuracy trade-off
+    pool_size: usize, // Fixed neuron pool – controls memory/accuracy trade-off
 }
 
 fn main() -> NeuroResult<()> {
@@ -46,14 +46,22 @@ fn main() -> NeuroResult<()> {
         args.threshold,
         args.leak,
         args.refractory,
-        1.0,                    // spike_cost
-        args.pool_size,         // Fixed pool size
+        1.0,            // spike_cost
+        args.pool_size, // Fixed pool size
     );
 
     for seq in stream_sequences(&args.input)? {
         counter.process_sequence(&seq);
     }
+    println!("\n=== K-mer Counts (first 20) ===");
+    let mut counts: Vec<_> = counter.counts.iter().map(|ref_multi| (*ref_multi.key(), *ref_multi.value())).collect();
+    counts.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by count descending
 
+    for (i, (kmer, count)) in counts.iter().take(20).enumerate() {
+        println!("{:3}: k-mer {:016x} → {} counts", i + 1, kmer, count);
+    }
+
+    println!("\nTotal distinct k-mers: {}", counts.len());
     info!(
         "Processing complete – total spikes: {}, energy: {}",
         counter.energy.total_spikes,
