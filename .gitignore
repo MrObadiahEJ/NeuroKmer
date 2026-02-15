@@ -1,0 +1,27 @@
+# Rust/Cargo build directory
+/target/
+
+# Common intermediate and build artifacts
+*.o
+*.obj
+*.rlib
+*.rmeta
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and temp
+*.log
+
+# Local data
+data/

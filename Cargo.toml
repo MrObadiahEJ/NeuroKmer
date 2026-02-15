@@ -1,0 +1,19 @@
+[package]
+name = "neurokmer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bio = "3.0.0"
+clap = { version = "4.5.58", features = ["derive"] }
+either = "1.15.0"
+env_logger = "0.11.9"
+log = "0.4.29"
+ndarray = "0.17.2"
+needletail = "0.6.3"
+rand = "0.10.0"
+rayon = "1.11.0"
+siphasher = "1.0.2"
+
+[dev-dependencies]
+criterion = "0.8.2"
