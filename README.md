@@ -2,11 +2,7 @@
 ```markdown
 # NeuroKmer – Neuromorphic K-mer Counting in Pure Rust
 
-<<<<<<< HEAD
 **v0.5.0** (True streaming + canonical k-mers + rolling hash)
-=======
-**v0.4.0** (True streaming + canonical k-mers + rolling hash)
->>>>>>> 135df17498656ee7074eac1248c94cb7093e893f
 
 NeuroKmer is a **brain-inspired, event-driven k-mer counter** that replaces traditional hash tables with a fixed-size pool of Leaky Integrate-and-Fire (LIF) spiking neurons.
 
