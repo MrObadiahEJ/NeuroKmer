@@ -1,4 +1,5 @@
 ```markdown
+```markdown
 # NeuroKmer – Neuromorphic K-mer Counting in Pure Rust
 
 <<<<<<< HEAD
@@ -17,12 +18,22 @@ Key advantages:
 - **Full parallelism** (rayon + atomics)
 - **Biological realism** (tunable LIF dynamics, event-driven, energy simulation)
 - **Real-world tested** on 115MB+ FASTA files with **perfect in-memory/streaming result match**
+- **Constant memory** (set by `--pool-size`, e.g., 1M neurons ≈ 50–100 MB)
+- **True low-memory streaming** (parallel workers + channels, O(threads × max_seq_len))
+- **Full parallelism** (rayon + atomics)
+- **Biological realism** (tunable LIF dynamics, event-driven, energy simulation)
+- **Real-world tested** on 115MB+ FASTA files with **perfect in-memory/streaming result match**
 
 ## Current Features
 - Streaming FASTA/FASTQ parsing (`needletail`)
 - Bit-packed + canonical k-mers with rolling hash
+- Streaming FASTA/FASTQ parsing (`needletail`)
+- Bit-packed + canonical k-mers with rolling hash
 - Fixed neuron pool with SipHash mapping
 - Per-neuron spike counting + global energy simulation
+- Thread-safe approximate counts (DashMap + atomics)
+- Top N abundant neuron groups output (highest spike rates = dominant k-mer groups)
+- Configurable simulation steps
 - Thread-safe approximate counts (DashMap + atomics)
 - Top N abundant neuron groups output (highest spike rates = dominant k-mer groups)
 - Configurable simulation steps
