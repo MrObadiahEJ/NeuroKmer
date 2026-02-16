@@ -1,6 +1,6 @@
 use clap::Parser;
 use log::info;
-use neurokmer::{init_logging, stream_sequences, SpikingKmerCounter, NeuroResult};
+use neurokmer::{NeuroResult, SpikingKmerCounter, init_logging, stream_sequences};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -15,7 +15,13 @@ struct Cli {
     k: usize,
 
     #[arg(long, default_value_t = 1_000_000)]
-    pool_size: usize,  // Fixed neuron pool – controls memory/accuracy trade-off
+    pool_size: usize,
+
+    #[arg(long, default_value_t = false)]
+    canonical: bool,
+
+    #[arg(long, default_value_t = false)]
+    streaming: bool, // New flag for streaming mode
 }
 
 fn main() -> NeuroResult<()> {
@@ -23,26 +29,23 @@ fn main() -> NeuroResult<()> {
     init_logging()?;
 
     info!(
-        "Starting NeuroKmer on {} (k={}, pool_size={})",
-        args.input, args.k, args.pool_size
+        "Starting NeuroKmer on {} (k={}, pool_size={}, canonical={}, streaming={})",
+        args.input, args.k, args.pool_size, args.canonical, args.streaming
     );
 
-    let mut counter = SpikingKmerCounter::new(
-        args.k,
-        1.0,     // threshold (fixed – tunable later)
-        0.95,    // leak
-        2,       // refractory
-        1.0,     // spike_cost
-        args.pool_size,
-    );
+    let mut counter =
+        SpikingKmerCounter::new(args.k, 1.0, 0.95, 2, 1.0, args.pool_size, args.canonical);
 
-    // Collect all sequences once (streaming but in-memory for parallel)
-    let seqs: Vec<Vec<u8>> = stream_sequences(&args.input)?.collect();
+    if args.streaming {
+        // Streaming mode: memory efficient, processes file directly
+        counter.process_file_streaming(&args.input)?;
+    } else {
+        // Original mode: loads all into memory first
+        let seqs: Vec<Vec<u8>> = stream_sequences(&args.input)?.collect();
+        counter.process_parallel(&seqs);
+    }
 
-    // Always use parallel version – fast & safe with atomics
-    counter.process_parallel(&seqs);
-
-    // Output top abundant neuron groups
+    // Output results (same as before)
     println!("\n=== Top 20 Abundant Neuron Groups (Highest Spike Rates) ===");
     let top = counter.top_abundant_neurons(20);
     if top.is_empty() {
@@ -61,13 +64,14 @@ fn main() -> NeuroResult<()> {
 
     info!(
         "Processing complete – total spikes: {}, energy: {}",
-        counter.energy.total_spikes,
+        counter.energy.total_spikes(),
         counter.energy_used()
     );
 
-    println!("\nTotal spikes fired: {}", counter.energy.total_spikes);
+    println!("\nTotal spikes fired: {}", counter.energy.total_spikes());
     println!("Simulated energy used: {}", counter.energy_used());
     println!("Neuron pool size used: {}", args.pool_size);
+    println!("Streaming mode: {}", args.streaming);
 
     Ok(())
 }
