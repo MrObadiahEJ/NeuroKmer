@@ -3,22 +3,22 @@
 // - spiking-neural-networks: Threshold/reset logic
 // - neural-rs: Stateful voltage integration
 // - WheatNNLeek: Leak + refractory period
-
+#[cfg(target_arch = "x86_64")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy)]
 pub struct LifNeuron {
-    pub voltage: f64,           // Membrane potential
-    pub threshold: f64,         // Spike threshold
-    pub reset_voltage: f64,     // Post-spike reset
-    pub leak: f64,              // Membrane leak constant (0.0 = no leak)
+    pub voltage: f32,           // Membrane potential
+    pub threshold: f32,         // Spike threshold
+    pub reset_voltage: f32,     // Post-spike reset
+    pub leak: f32,              // Membrane leak constant (0.0 = no leak)
     pub refractory_ticks: u32,  // Remaining refractory time
     pub refractory_period: u32, // Fixed refractory duration
     pub spike_count: u64,       // NEW: Track individual spikes
 }
 
 impl LifNeuron {
-    pub fn new(threshold: f64, leak: f64, refractory_period: u32) -> Self {
+    pub fn new(threshold: f32, leak: f32, refractory_period: u32) -> Self {
         Self {
             voltage: 0.0,
             threshold,
@@ -31,7 +31,7 @@ impl LifNeuron {
     }
 
     /// Integrate input current + apply leak; return true if spike
-    pub fn update(&mut self, input_current: f64) -> bool {
+    pub fn update(&mut self, input_current: f32) -> bool {
         if self.refractory_ticks > 0 {
             self.refractory_ticks -= 1;
             return false;
@@ -41,13 +41,92 @@ impl LifNeuron {
         self.voltage = self.voltage * self.leak + input_current;
 
         if self.voltage >= self.threshold {
-            self.voltage = self.reset_voltage;
+            self.voltage = 0.0;
             self.refractory_ticks = self.refractory_period;
             self.spike_count += 1; // NEW: Count spike
             true // Spike fired
         } else {
             false
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn update_batch_simd(
+        voltages: &mut [f32; 8],
+        thresholds: &[f32; 8],
+        leaks: &[f32; 8],
+        currents: &[f32; 8],
+        refractory: &mut [u32; 8],
+        refractory_period: u32,
+    ) -> [u64; 8] {
+        let mut spikes = [0u64; 8];
+
+        unsafe {
+            // Load vectors
+
+            use std::arch::x86_64::{
+                _CMP_GE_OQ, _mm256_add_ps, _mm256_cmp_ps, _mm256_loadu_ps, _mm256_movemask_ps,
+                _mm256_mul_ps, _mm256_storeu_ps,
+            };
+            let v = _mm256_loadu_ps(voltages.as_ptr());
+            let t = _mm256_loadu_ps(thresholds.as_ptr());
+            let l = _mm256_loadu_ps(leaks.as_ptr());
+            let c = _mm256_loadu_ps(currents.as_ptr());
+
+            // v = v * l + c
+            let v_mul_l = _mm256_mul_ps(v, l);
+            let v_new = _mm256_add_ps(v_mul_l, c);
+
+            // Compare v_new >= t
+            let cmp = _mm256_cmp_ps(v_new, t, _CMP_GE_OQ);
+            let spike_mask = _mm256_movemask_ps(cmp) as u8;
+
+            // Store new voltages
+            _mm256_storeu_ps(voltages.as_mut_ptr(), v_new);
+
+            // Handle spikes and refractory
+            for i in 0..8 {
+                if refractory[i] > 0 {
+                    refractory[i] -= 1;
+                    continue;
+                }
+
+                if (spike_mask >> i) & 1 == 1 {
+                    voltages[i] = 0.0; // Reset
+                    refractory[i] = refractory_period;
+                    spikes[i] = 1;
+                }
+            }
+
+        }
+        spikes
+    }
+    /// Fallback scalar version for non-x86_64 platforms
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn update_batch_simd(
+        voltages: &mut [f32; 8],
+        thresholds: &[f32; 8],
+        leaks: &[f32; 8],
+        currents: &[f32; 8],
+        refractory: &mut [u32; 8],
+        refractory_period: u32,
+    ) -> [u64; 8] {
+        let mut spikes = [0u64; 8];
+        for i in 0..8 {
+            if refractory[i] > 0 {
+                refractory[i] -= 1;
+                continue;
+            }
+
+            voltages[i] = voltages[i] * leaks[i] + currents[i];
+
+            if voltages[i] >= thresholds[i] {
+                voltages[i] = 0.0;
+                refractory[i] = refractory_period;
+                spikes[i] = 1;
+            }
+        }
+        spikes
     }
 }
 
@@ -64,18 +143,18 @@ impl EnergyTracker {
             total_energy: AtomicU64::new(0),
         }
     }
-    
+
     pub fn add_spike(&self, cost: f64) {
         self.total_spikes.fetch_add(1, Ordering::Relaxed);
         // Convert float to fixed-point (multiply by 1000 to preserve 3 decimal places)
         let cost_fixed = (cost * 1000.0) as u64;
         self.total_energy.fetch_add(cost_fixed, Ordering::Relaxed);
     }
-    
+
     pub fn total_spikes(&self) -> u64 {
         self.total_spikes.load(Ordering::Relaxed)
     }
-    
+
     pub fn total_energy(&self) -> f64 {
         (self.total_energy.load(Ordering::Relaxed) as f64) / 1000.0
     }

@@ -11,7 +11,6 @@ use std::collections::HashMap;
 // Add to Cargo.toml: siphasher = "0.3"
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::channel;
 use std::thread;
 
 pub struct SpikingKmerCounter {
@@ -20,8 +19,8 @@ pub struct SpikingKmerCounter {
     pub k: usize,
     pool_size: usize, // NEW: Fixed neuron count
     spike_cost: f64,
-    threshold: f64,
-    leak: f64,
+    threshold: f32,
+    leak: f32,
     refractory: u32,
     neuron_currents: Vec<AtomicU64>, // Thread-safe atomic for parallel accumulation
     pub kmer_per_neuron: DashMap<usize, u32>, // Optional: Keep track of unique k-mers per neuron for collision stats
@@ -29,13 +28,19 @@ pub struct SpikingKmerCounter {
     neuron_to_kmers: Vec<Vec<u64>>, // Track which k-mers mapped to each neuron
     pub use_canonical: bool,
     steps: usize, // Number of steps to simulate for spike generation
+    // Add these for SIMD batching
+    batch_voltages: Vec<f32>,
+    batch_thresholds: Vec<f32>,
+    batch_leaks: Vec<f32>,
+    batch_refractory: Vec<u32>,
+    current_multiplier: f32,
 }
 
 impl SpikingKmerCounter {
     pub fn new(
         k: usize,
-        threshold: f64,
-        leak: f64,
+        threshold: f32,
+        leak: f32,
         refractory: u32,
         spike_cost: f64,
         pool_size: usize,
@@ -46,6 +51,7 @@ impl SpikingKmerCounter {
             .collect();
         let neuron_currents: Vec<AtomicU64> = (0..pool_size).map(|_| AtomicU64::new(0)).collect();
         let neuron_to_kmers = (0..pool_size).map(|_| Vec::new()).collect();
+        let padded_size = (pool_size + 7) & !7;
 
         Self {
             neurons,
@@ -62,6 +68,11 @@ impl SpikingKmerCounter {
             counts: DashMap::new(),
             use_canonical,
             steps: 1000, // Default steps for spike simulation
+            batch_voltages: vec![0.0; padded_size],
+            batch_thresholds: vec![threshold as f32; padded_size],
+            batch_leaks: vec![leak as f32; padded_size],
+            batch_refractory: vec![0; padded_size],
+            current_multiplier: 1000.0,
         }
     }
     fn map_kmer_to_neuron(&self, packed: u64) -> usize {
@@ -164,6 +175,14 @@ impl SpikingKmerCounter {
             self.neuron_currents[idx].store(current, Ordering::Relaxed);
         }
 
+        // DEBUG: Check total current in in-memory version
+        let total_current_sum: u64 = self
+            .neuron_currents
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum();
+        println!("  In-memory total current: {}", total_current_sum);
+
         // Spike simulation
         for (idx, neuron) in self.neurons.iter_mut().enumerate() {
             let total_current = total_currents[idx] as f64;
@@ -174,12 +193,13 @@ impl SpikingKmerCounter {
             let per_step = total_current / self.steps as f64;
 
             for _ in 0..self.steps {
-                if neuron.update(per_step) {
+                if neuron.update(per_step as f32) {
                     self.energy.add_spike(self.spike_cost);
                 }
             }
         }
     }
+
     pub fn process_sequence(&mut self, seq: &[u8]) {
         let mut local_unique = vec![false; self.pool_size];
 
@@ -245,7 +265,7 @@ impl SpikingKmerCounter {
         // Spike simulation (same as before)
         for (idx, neuron) in self.neurons.iter_mut().enumerate() {
             let current = self.neuron_currents[idx].load(Ordering::Relaxed) as f64;
-            if current > 0.0 && neuron.update(current) {
+            if current > 0.0 && neuron.update(current as f32) {
                 self.energy.add_spike(self.spike_cost);
             }
             self.neuron_currents[idx].store(0, Ordering::Relaxed);
@@ -474,9 +494,22 @@ impl SpikingKmerCounter {
             self.neuron_currents[idx].store(current, Ordering::Relaxed);
         }
 
+        // DEBUG: Check total current
+        let total_current_sum: u64 = self
+            .neuron_currents
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum();
+        println!(
+            "  Total accumulated current before SIMD: {}",
+            total_current_sum
+        );
+
         // Run spike simulation
-        println!("  Running parallel spike simulation...");
-        self.simulate_spikes_parallel();
+        println!("  Running SIMD spike simulation...");
+        self.simulate_spikes_simd();
+        // println!("  Running parallel spike simulation...");
+        // self.simulate_spikes_parallel();
         println!("  Streaming complete!");
         Ok(())
     }
@@ -493,7 +526,7 @@ impl SpikingKmerCounter {
             let per_step = total_current / self.steps as f64;
 
             for _ in 0..self.steps {
-                if neuron.update(per_step) {
+                if neuron.update(per_step as f32) {
                     self.energy.add_spike(self.spike_cost);
                 }
             }
@@ -521,7 +554,7 @@ impl SpikingKmerCounter {
                     let mut local_spikes = 0u64;
 
                     for _ in 0..self.steps {
-                        if neuron.update(per_step) {
+                        if neuron.update(per_step as f32) {
                             local_spikes += 1;
                         }
                     }
@@ -534,6 +567,129 @@ impl SpikingKmerCounter {
                         .fetch_add(cost_fixed, Ordering::Relaxed);
                 }
             });
+    }
+
+    /// SIMD-accelerated spike simulation - MATCHES SCALAR PRECISION
+    fn simulate_spikes_simd(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        let steps = self.steps as u64;
+        if steps == 0 {
+            return;
+        }
+
+        let spike_cost = self.spike_cost;
+
+        // Pre-load persistent batch arrays with current neuron state
+        for i in 0..self.pool_size {
+            let neuron = &self.neurons[i];
+            self.batch_voltages[i] = neuron.voltage;
+            self.batch_thresholds[i] = neuron.threshold;
+            self.batch_leaks[i] = neuron.leak;
+            self.batch_refractory[i] = neuron.refractory_ticks;
+        }
+
+        // Store total currents for each neuron
+        let mut total_currents_per_neuron = vec![0u64; self.pool_size];
+        for i in 0..self.pool_size {
+            total_currents_per_neuron[i] = self.neuron_currents[i].load(Ordering::Relaxed);
+        }
+
+        let mut per_neuron_spikes = vec![0u64; self.pool_size];
+        let mut total_spikes = 0u64;
+        let mut total_energy_fixed = 0u64;
+
+        // Process in batches of 8 neurons
+        for batch_start in (0..self.pool_size).step_by(8) {
+            let batch_end = (batch_start + 8).min(self.pool_size);
+            let batch_size = batch_end - batch_start;
+
+            // Fixed-size arrays
+            let mut v_batch = [0.0f32; 8];
+            let mut t_batch = [0.0f32; 8];
+            let mut l_batch = [0.0f32; 8];
+            let mut r_batch = [0u32; 8];
+            let mut current_values = [0u64; 8]; // Store raw currents for this batch
+
+            // Copy initial state for this batch
+            for j in 0..batch_size {
+                let idx = batch_start + j;
+                v_batch[j] = self.batch_voltages[idx];
+                t_batch[j] = self.batch_thresholds[idx];
+                l_batch[j] = self.batch_leaks[idx];
+                r_batch[j] = self.batch_refractory[idx];
+                current_values[j] = total_currents_per_neuron[idx];
+            }
+
+            let mut batch_spikes = [0u64; 8];
+
+            // Simulate all timesteps
+            for _ in 0..steps {
+                // Calculate per-step current INSIDE the loop (like scalar version)
+                let mut c_batch = [0.0f32; 8];
+                for j in 0..batch_size {
+                    if current_values[j] > 0 {
+                        // Use f64 division for exact match with scalar
+                        let per_step_f64 = current_values[j] as f64 / steps as f64;
+                        c_batch[j] = per_step_f64 as f32;
+                    }
+                }
+
+                let spikes_this_step = LifNeuron::update_batch_simd(
+                    &mut v_batch,
+                    &t_batch,
+                    &l_batch,
+                    &c_batch,
+                    &mut r_batch,
+                    self.refractory,
+                );
+
+                for j in 0..batch_size {
+                    batch_spikes[j] += spikes_this_step[j] as u64;
+                }
+            }
+
+            // DEBUG for neuron 105413
+            if batch_start <= 105413 && 105413 < batch_end {
+                let local_idx = 105413 - batch_start;
+                println!(
+                    "    DEBUG neuron 105413: spikes = {}, final voltage = {:.4}, refractory = {}, current = {}",
+                    batch_spikes[local_idx],
+                    v_batch[local_idx],
+                    r_batch[local_idx],
+                    current_values[local_idx]
+                );
+            }
+
+            // Accumulate results
+            for j in 0..batch_size {
+                let idx = batch_start + j;
+                self.batch_voltages[idx] = v_batch[j];
+                self.batch_refractory[idx] = r_batch[j];
+
+                let spikes = batch_spikes[j];
+                per_neuron_spikes[idx] += spikes;
+                total_spikes += spikes;
+                total_energy_fixed += spikes * (spike_cost * 1000.0) as u64;
+            }
+        }
+
+        // Final write-back to neurons
+        for i in 0..self.pool_size {
+            let neuron = &mut self.neurons[i];
+            neuron.voltage = self.batch_voltages[i];
+            neuron.refractory_ticks = self.batch_refractory[i];
+            neuron.spike_count += per_neuron_spikes[i];
+        }
+
+        self.energy
+            .total_spikes
+            .fetch_add(total_spikes, Ordering::Relaxed);
+        self.energy
+            .total_energy
+            .fetch_add(total_energy_fixed, Ordering::Relaxed);
+
+        println!("    SIMD total spikes: {}", total_spikes);
     }
 
     /// Get top spiking neurons (proxy for most abundant k-mer groups)
@@ -571,5 +727,24 @@ impl SpikingKmerCounter {
     /// Get the current number of simulation steps
     pub fn get_steps(&self) -> usize {
         self.steps
+    }
+
+    pub fn simulate_spikes_auto(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                println!("  Using AVX2 SIMD (8-wide)");
+                self.simulate_spikes_simd();
+            } else {
+                println!("  Using parallel scalar (AVX2 not available)");
+                self.simulate_spikes_parallel();
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            println!("  Using parallel scalar");
+            self.simulate_spikes_parallel();
+        }
     }
 }
