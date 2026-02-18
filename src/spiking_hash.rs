@@ -279,16 +279,16 @@ impl SpikingKmerCounter {
         let k = self.k;
         let pool_size = self.pool_size;
         let use_canonical = self.use_canonical;
-        let batch_send_interval = 10000; // Increased from 1000
+        let batch_send_interval = 10000;
 
         // Create channels using crossbeam
         let (seq_tx, seq_rx) = unbounded::<Vec<u8>>();
         let (result_tx, result_rx) = unbounded::<(
-            Vec<u64>, // indices
-            Vec<u64>, // neuron currents (both u64 for consistency)
+            Vec<u64>,        // neuron indices (compact)
+            Vec<u64>,        // neuron currents (compact)
+            Vec<(u64, u32)>, // k-mer counts (kmer_hash, count) - only non-zero, aggregated
         )>();
 
-        // Number of worker threads
         let num_workers = rayon::current_num_threads();
         println!("  Starting {} worker threads", num_workers);
 
@@ -304,8 +304,10 @@ impl SpikingKmerCounter {
             workers.push(thread::spawn(move || {
                 println!("    Worker {} started", worker_id);
 
-                // OPTIMIZATION: Use Vec<u64> for currents - lock-free and cache-friendly
+                // FAST PATH: Vec<u64> for neuron currents (no HashMap overhead)
                 let mut local_currents = vec![0u64; pool_size];
+                // SLOW PATH: Only for k-mers that actually appear (sparse)
+                let mut local_kmer_counts: HashMap<u64, u32> = HashMap::with_capacity(1024);
                 let mut seq_count = 0;
 
                 let map_kmer_to_neuron = |packed: u64| -> usize {
@@ -328,6 +330,7 @@ impl SpikingKmerCounter {
 
                         let idx = map_kmer_to_neuron(canonical);
                         local_currents[idx] += 1;
+                        *local_kmer_counts.entry(canonical).or_insert(0) += 1;
 
                         for i in 1..=seq.len() - k {
                             let prev_base = seq[i - 1];
@@ -337,34 +340,40 @@ impl SpikingKmerCounter {
 
                             let idx = map_kmer_to_neuron(canonical);
                             local_currents[idx] += 1;
+                            *local_kmer_counts.entry(canonical).or_insert(0) += 1;
                         }
                     } else {
                         for window in seq.windows(k) {
                             let packed = crate::utils::pack_kmer(window);
                             let idx = map_kmer_to_neuron(packed);
                             local_currents[idx] += 1;
+                            *local_kmer_counts.entry(packed).or_insert(0) += 1;
                         }
                     }
 
-                    // Send results less frequently (amortize channel overhead)
+                    // Send results periodically
                     if seq_count % batch_send_interval == 0 {
-                        // Only send non-zero entries to reduce bandwidth
+                        // Compact neuron currents (FAST)
                         let mut compact_currents = Vec::with_capacity(pool_size / 10);
                         let mut indices = Vec::with_capacity(pool_size / 10);
 
                         for (idx, &val) in local_currents.iter().enumerate() {
                             if val > 0 {
-                                compact_currents.push(val); // val is u64
-                                indices.push(idx as u64); // idx is usize, cast to u64
+                                compact_currents.push(val);
+                                indices.push(idx as u64);
                             }
                         }
 
-                        // Send compacted format: (indices, values)
-                        if result_tx.send((indices, compact_currents)).is_err() {
+                        // Convert HashMap to Vec for sending (avoid serialization overhead)
+                        let kmer_vec: Vec<(u64, u32)> = local_kmer_counts.drain().collect();
+
+                        if result_tx
+                            .send((indices, compact_currents, kmer_vec))
+                            .is_err()
+                        {
                             break;
                         }
 
-                        // Reset
                         local_currents.fill(0);
                     }
                 }
@@ -380,13 +389,15 @@ impl SpikingKmerCounter {
 
                 for (idx, &val) in local_currents.iter().enumerate() {
                     if val > 0 {
-                        compact_currents.push(val); // val is u64
-                        indices.push(idx as u64); // cast to u64
+                        compact_currents.push(val);
+                        indices.push(idx as u64);
                     }
                 }
 
-                if !compact_currents.is_empty() {
-                    let _ = result_tx.send((indices, compact_currents));
+                let kmer_vec: Vec<(u64, u32)> = local_kmer_counts.drain().collect();
+
+                if !compact_currents.is_empty() || !kmer_vec.is_empty() {
+                    let _ = result_tx.send((indices, compact_currents, kmer_vec));
                 }
             }));
         }
@@ -410,7 +421,7 @@ impl SpikingKmerCounter {
             NeuroResult::Ok(())
         });
 
-        // Aggregator - optimized for compact format
+        // Aggregator - handles both fast neuron currents AND k-mer counts
         println!("  Aggregator started");
         self.counts.clear();
         self.kmer_per_neuron.clear();
@@ -418,13 +429,21 @@ impl SpikingKmerCounter {
         let mut total_currents = vec![0u64; self.pool_size];
         let mut result_count = 0;
 
-        while let Ok((indices, values)) = result_rx.recv() {
+        while let Ok((indices, values, kmer_counts)) = result_rx.recv() {
             result_count += 1;
 
-            // Fast accumulation without HashMap overhead
+            // Fast accumulation for neuron currents
             for (i, &idx_u64) in indices.iter().enumerate() {
                 let idx = idx_u64 as usize;
                 total_currents[idx] += values[i];
+            }
+
+            // Merge k-mer counts (slower but necessary for get_count)
+            for (kmer, count) in kmer_counts {
+                self.counts
+                    .entry(kmer)
+                    .or_insert(AtomicU32::new(0))
+                    .fetch_add(count, Ordering::Relaxed);
             }
         }
 
@@ -443,6 +462,14 @@ impl SpikingKmerCounter {
         // Store final currents
         for (idx, &current) in total_currents.iter().enumerate() {
             self.neuron_currents[idx].store(current, Ordering::Relaxed);
+        }
+
+        // Rebuild kmer_per_neuron from counts
+        self.kmer_per_neuron.clear();
+        for entry in self.counts.iter() {
+            let kmer = *entry.key();
+            let idx = self.map_kmer_to_neuron(kmer);
+            *self.kmer_per_neuron.entry(idx).or_insert(0) += 1;
         }
 
         let total_current_sum: u64 = total_currents.iter().sum();
