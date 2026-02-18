@@ -22,7 +22,7 @@ pub struct SpikingKmerCounter {
     threshold: f32,
     leak: f32,
     refractory: u32,
-    neuron_currents: Vec<AtomicU64>, // Thread-safe atomic for parallel accumulation
+    pub(crate) neuron_currents: Vec<AtomicU64>, // Thread-safe atomic for parallel accumulation
     pub kmer_per_neuron: DashMap<usize, u32>, // Optional: Keep track of unique k-mers per neuron for collision stats
     pub counts: DashMap<u64, AtomicU32>,
     neuron_to_kmers: Vec<Vec<u64>>, // Track which k-mers mapped to each neuron
@@ -75,7 +75,7 @@ impl SpikingKmerCounter {
             current_multiplier: 1000.0,
         }
     }
-    fn map_kmer_to_neuron(&self, packed: u64) -> usize {
+    pub fn map_kmer_to_neuron(&self, packed: u64) -> usize {
         let mut hasher = SipHasher13::new_with_keys(0, 0);
         packed.hash(&mut hasher);
         (hasher.finish() % self.pool_size as u64) as usize
@@ -711,5 +711,57 @@ impl SpikingKmerCounter {
             println!("  Using parallel scalar");
             self.simulate_spikes_parallel();
         }
+    }
+
+    // Add these public getter methods to impl SpikingKmerCounter
+    pub fn get_threshold(&self) -> f32 {
+        self.threshold
+    }
+    pub fn get_leak(&self) -> f32 {
+        self.leak
+    }
+    pub fn get_refractory(&self) -> u32 {
+        self.refractory
+    }
+    pub fn get_spike_cost(&self) -> f64 {
+        self.spike_cost
+    }
+    pub fn get_pool_size(&self) -> usize {
+        self.pool_size
+    }
+
+    /// Get mutable access to neurons for temporal coding
+    pub fn neurons_mut(&mut self) -> &mut Vec<LifNeuron> {
+        &mut self.neurons
+    }
+
+    /// Get neuron voltage
+    pub fn get_neuron_voltage(&self, idx: usize) -> f32 {
+        self.neurons.get(idx).map(|n| n.voltage).unwrap_or(0.0)
+    }
+
+    /// Set neuron voltage
+    pub fn set_neuron_voltage(&mut self, idx: usize, voltage: f32) {
+        if let Some(neuron) = self.neurons.get_mut(idx) {
+            neuron.voltage = voltage;
+        }
+    }
+
+    /// Increment neuron spike count
+    pub fn increment_neuron_spike(&mut self, idx: usize) {
+        if let Some(neuron) = self.neurons.get_mut(idx) {
+            neuron.spike_count += 1;
+        }
+    }
+
+    /// Add energy directly
+    pub fn add_energy(&self, spikes: u64, cost: f64) {
+        self.energy
+            .total_spikes
+            .fetch_add(spikes, Ordering::Relaxed);
+        let energy_fixed = (spikes as f64 * cost * 1000.0) as u64;
+        self.energy
+            .total_energy
+            .fetch_add(energy_fixed, Ordering::Relaxed);
     }
 }

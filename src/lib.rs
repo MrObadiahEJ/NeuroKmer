@@ -11,8 +11,15 @@ pub use models::*;
 pub use utils::*;
 pub use spiking_hash::*;
 pub use associative::*;
-
+pub mod temporal;
+pub use temporal::*;
 use log::info;
+pub mod stdp;
+pub use stdp::*;
+pub mod associative_memory;
+pub use associative_memory::*;
+pub mod distributed;
+pub use distributed::*;
 
 /// Top-level result type for the crate – makes error handling consistent
 pub type NeuroResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
