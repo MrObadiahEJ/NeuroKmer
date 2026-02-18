@@ -62,43 +62,55 @@ impl LifNeuron {
         let mut spikes = [0u64; 8];
 
         unsafe {
-            // Load vectors
+            use std::arch::x86_64::*;
 
-            use std::arch::x86_64::{
-                _CMP_GE_OQ, _mm256_add_ps, _mm256_cmp_ps, _mm256_loadu_ps, _mm256_movemask_ps,
-                _mm256_mul_ps, _mm256_storeu_ps,
-            };
+            // Load vectors
             let v = _mm256_loadu_ps(voltages.as_ptr());
             let t = _mm256_loadu_ps(thresholds.as_ptr());
             let l = _mm256_loadu_ps(leaks.as_ptr());
             let c = _mm256_loadu_ps(currents.as_ptr());
 
-            // v = v * l + c
-            let v_mul_l = _mm256_mul_ps(v, l);
-            let v_new = _mm256_add_ps(v_mul_l, c);
+            // Create active mask: refractory == 0 means active (all bits set)
+            let mut active_arr = [0u32; 8];
+            for i in 0..8 {
+                if refractory[i] == 0 {
+                    active_arr[i] = 0xFFFFFFFFu32;
+                }
+            }
+            let active_mask = _mm256_loadu_ps(active_arr.as_ptr() as *const f32);
 
-            // Compare v_new >= t
-            let cmp = _mm256_cmp_ps(v_new, t, _CMP_GE_OQ);
-            let spike_mask = _mm256_movemask_ps(cmp) as u8;
+            // Compute v * leak + current (only for active neurons)
+            let v_leaked = _mm256_mul_ps(v, l);
+            let v_with_current = _mm256_add_ps(v_leaked, c);
 
-            // Store new voltages
-            _mm256_storeu_ps(voltages.as_mut_ptr(), v_new);
+            // Blend: select v_with_current where active, keep v where refractory
+            let v_new = _mm256_blendv_ps(v, v_with_current, active_mask);
 
-            // Handle spikes and refractory
+            // Spike detection: mask threshold to MAX for refractory neurons
+            // This prevents refractory neurons from spiking
+            let max_val = _mm256_set1_ps(f32::MAX);
+            let t_effective = _mm256_blendv_ps(max_val, t, active_mask);
+
+            // Compare for spikes (v_new >= t_effective)
+            let spike_cmp = _mm256_cmp_ps(v_new, t_effective, _CMP_GE_OQ);
+            let spike_mask = _mm256_movemask_ps(spike_cmp) as u8;
+
+            // Reset voltage to 0 where spike occurred
+            let zero = _mm256_setzero_ps();
+            let v_reset = _mm256_blendv_ps(v_new, zero, spike_cmp);
+            _mm256_storeu_ps(voltages.as_mut_ptr(), v_reset);
+
+            // Update refractory counts and record spikes
             for i in 0..8 {
                 if refractory[i] > 0 {
                     refractory[i] -= 1;
-                    continue;
-                }
-
-                if (spike_mask >> i) & 1 == 1 {
-                    voltages[i] = 0.0; // Reset
+                } else if (spike_mask >> i) & 1 == 1 {
                     refractory[i] = refractory_period;
                     spikes[i] = 1;
                 }
             }
-
         }
+
         spikes
     }
     /// Fallback scalar version for non-x86_64 platforms

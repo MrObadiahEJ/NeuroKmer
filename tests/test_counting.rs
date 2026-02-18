@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn test_streaming_memory_usage() {
-        let file_path = "data/sm.fasta";
+        let file_path = "data/sample1.fasta";
         if !std::path::Path::new(file_path).exists() {
             println!("Skipping memory test: {} not found", file_path);
             println!("Available files in data/:");
