@@ -4,8 +4,8 @@ use std::time::Duration;
 
 fn bench_with_real_files(c: &mut Criterion) {
     let files = [
-        ("small_genome.fasta", "0.8KB"),
-        ("middle.fasta", "1.5MB"),
+        ("sm.fasta", "0.8KB"),
+        ("md.fasta", "1.5MB"),
         ("sample1.fasta", "115MB"),
     ];
 
